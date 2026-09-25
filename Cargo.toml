@@ -1,0 +1,8 @@
+[package]
+name = "minigrep"
+version = "0.1.0"
+edition = "2021"
+description = "A miniature grep clone in safe Rust"
+license = "MIT"
+
+[dependencies]
