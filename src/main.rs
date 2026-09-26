@@ -1,154 +1,271 @@
-// rust-grep-lite — a miniature grep clone in safe Rust.
-// Usage: minigrep <pattern> <file1> [file2 ...]
-// Build: cargo build --release
+//! `searchlight` binary entry point — wiring only.
+//!
+//! The pipeline is: parse the command line, validate the search roots,
+//! walk the tree in parallel, search the candidate files on the worker
+//! pool, render the results and map the outcome onto process exit codes
+//! (`0` matches found, `1` no matches, `2` error). All of the actual logic
+//! lives in the library so `cargo test` exercises it without spawning the
+//! binary.
 
 use std::env;
-use std::fs;
-use std::process::exit;
+use std::io::{self, IsTerminal, Write};
+use std::process;
 
-const RESET: &str = "\x1b[0m";
-const RED: &str = "\x1b[31m";
-const GREEN: &str = "\x1b[32m";
-const CYAN: &str = "\x1b[36m";
-
-fn parse_args() -> (String, Vec<String>) {
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 2 {
-        eprintln!("usage: minigrep <pattern> <file1> [file2 ...]");
-        eprintln!("options:");
-        eprintln!("  -i          case-insensitive matching");
-        eprintln!("  -n          suppress line numbers");
-        eprintln!("example: minigrep -i error server.log");
-        exit(2);
-    }
-    (args[0].clone(), args[1..].to_vec())
-}
-
-struct Config {
-    pattern: String,
-    files: Vec<String>,
-    ignore_case: bool,
-    show_numbers: bool,
-}
-
-impl Config {
-    fn from_flags(args: &[String]) -> Config {
-        let mut pattern = String::new();
-        let mut files = Vec::new();
-        let mut ignore_case = false;
-        let mut show_numbers = true;
-
-        for arg in args {
-            match arg.as_str() {
-                "-i" => ignore_case = true,
-                "-n" => show_numbers = false,
-                other if pattern.is_empty() => pattern = other.to_string(),
-                other => files.push(other.to_string()),
-            }
-        }
-        Config { pattern, files, ignore_case, show_numbers }
-    }
-
-    fn matches(&self, line: &str) -> bool {
-        if self.ignore_case {
-            line.to_lowercase().contains(&self.pattern.to_lowercase())
-        } else {
-            line.contains(&self.pattern)
-        }
-    }
-}
-
-fn highlight(line: &str, pattern: &str, ignore_case: bool) -> String {
-    let (hay, needle) = if ignore_case {
-        (line.to_lowercase(), pattern.to_lowercase())
-    } else {
-        (line.to_string(), pattern.to_string())
-    };
-    let mut out = String::new();
-    let mut i = 0;
-    while i < line.len() {
-        if hay[i..].starts_with(&needle) {
-            out.push_str(RED);
-            out.push_str(&line[i..i + needle.len()]);
-            out.push_str(RESET);
-            i += needle.len();
-        } else {
-            let ch = line[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    out
-}
-
-fn process_file(path: &str, cfg: &Config) -> std::io::Result<usize> {
-    let content = fs::read_to_string(path)?;
-    let mut hits = 0;
-    for (idx, line) in content.lines().enumerate() {
-        if cfg.matches(line) {
-            hits += 1;
-            print!("{GREEN}{path}{RESET}");
-            if cfg.show_numbers {
-                print!(":{CYAN}{}{RESET}", idx + 1);
-            }
-            println!(": {}", highlight(line, &cfg.pattern, cfg.ignore_case));
-        }
-    }
-    Ok(hits)
-}
+use searchlight::args::{ColorChoice, Config, ParseOutcome};
+use searchlight::error::io_message;
+use searchlight::filters::FileFilter;
+use searchlight::output::{RenderOptions, Renderer};
+use searchlight::pattern::Pattern;
+use searchlight::search::{search_files, FileOutcome, SearchOptions};
+use searchlight::sizes;
+use searchlight::stats::{format_duration, Stats};
+use searchlight::timer::Timer;
+use searchlight::walk::{walk, WalkOptions};
+use searchlight::{TAGLINE, VERSION};
 
 fn main() {
-    let (raw0, raw_rest) = parse_args();
-    let _ = raw0;
-    let cfg = Config::from_flags(&raw_rest);
+    let code = run();
+    // process::exit skips destructors, so flush the buffered stdout first.
+    let _ = io::stdout().flush();
+    process::exit(code);
+}
 
-    if cfg.pattern.is_empty() || cfg.files.is_empty() {
-        eprintln!("error: pattern and at least one file are required");
-        exit(2);
-    }
+/// Run one search, returning the process exit code.
+fn run() -> i32 {
+    let argv: Vec<String> = env::args().skip(1).collect();
+    let config = match Config::parse_from(argv) {
+        Ok(ParseOutcome::Config(config)) => config,
+        Ok(ParseOutcome::Help) => {
+            println!("{}", help_text());
+            return 0;
+        }
+        Ok(ParseOutcome::Version) => {
+            println!("searchlight {}", VERSION);
+            return 0;
+        }
+        Err(err) => {
+            eprintln!("searchlight: {}", err);
+            eprintln!("Try 'searchlight --help' for more information.");
+            return err.exit_code();
+        }
+    };
 
-    let mut total = 0usize;
-    let mut had_error = false;
-    for file in &cfg.files {
-        match process_file(file, &cfg) {
-            Ok(hits) => total += hits,
-            Err(err) => {
-                eprintln!("minigrep: {file}: {err}");
-                had_error = true;
-            }
+    let pattern = match Pattern::new(&config.pattern, config.ignore_case, config.word_regexp) {
+        Ok(pattern) => pattern,
+        Err(err) => {
+            eprintln!("searchlight: {}", err);
+            return 2;
+        }
+    };
+
+    let filter = match FileFilter::from_config(&config) {
+        Ok(filter) => filter,
+        Err(err) => {
+            eprintln!("searchlight: {}", err);
+            return 2;
+        }
+    };
+
+    // Fail fast on roots that cannot even be inspected (typo'ed paths are
+    // the most common mistake, and exit code 2 must not depend on timing).
+    for path in &config.paths {
+        if let Err(err) = std::fs::metadata(path) {
+            eprintln!("searchlight: {}: {}", path.display(), io_message(&err));
+            return 2;
         }
     }
 
-    if total > 0 {
-        println!("{GREEN}-- {total} matching line(s) --{RESET}");
+    let stats = Stats::new();
+    let mut timer = Timer::start();
+
+    timer.begin("walk");
+    let outcome = walk(
+        &config.paths,
+        WalkOptions {
+            max_depth: config.max_depth,
+            follow: config.follow_symlinks,
+            hidden: config.hidden,
+            no_ignore: config.no_ignore,
+            threads: config.threads,
+        },
+        &filter,
+        &stats,
+    );
+    timer.end();
+
+    for failure in &outcome.errors {
+        stats.bump(&stats.errors, 1);
+        if !config.no_messages {
+            eprintln!("searchlight: {}: {}", failure.path.display(), failure.message);
+        }
     }
-    exit(if had_error { 1 } else if total == 0 { 3 } else { 0 });
+
+    timer.begin("search");
+    let outcomes = search_files(
+        &outcome.files,
+        &pattern,
+        &SearchOptions {
+            max_count: config.max_count,
+            invert: config.invert_match,
+            before: config.before_context,
+            after: config.after_context,
+        },
+        &stats,
+        config.threads,
+    );
+    timer.end();
+
+    let render_options =
+        RenderOptions::from_config(&config, resolve_color(&config), with_filename(&config));
+    let stdout = io::stdout();
+    let mut renderer = Renderer::new(stdout.lock(), render_options);
+
+    let mut found: u64 = 0;
+    let mut write_error: Option<io::Error> = None;
+    for file_outcome in &outcomes {
+        match file_outcome {
+            FileOutcome::Scanned(result) => {
+                found += result.matches.len() as u64;
+                if config.quiet {
+                    continue;
+                }
+                if let Err(err) = renderer.write_result(result) {
+                    write_error = Some(err);
+                    break;
+                }
+            }
+            FileOutcome::Binary(path) => {
+                if !config.no_messages {
+                    eprintln!("searchlight: {}: binary file skipped", path.display());
+                }
+            }
+            FileOutcome::Failed(error) => {
+                if !config.no_messages {
+                    eprintln!("searchlight: {}: {}", error.path.display(), error.message);
+                }
+            }
+        }
+    }
+    if write_error.is_none() {
+        if let Err(err) = renderer.flush() {
+            write_error = Some(err);
+        }
+    }
+
+    if config.stats {
+        eprint!("{}", stats.snapshot());
+        let timeline = timer.finish();
+        eprintln!("total wall time    {}", format_duration(timeline.total));
+        eprintln!(
+            "size limits        {}",
+            sizes::describe_bounds(config.min_size, config.max_size)
+        );
+    }
+
+    if let Some(err) = write_error {
+        // `searchlight foo big-tree | head -n 3` closes the pipe early; that
+        // is a normal way to use the tool, not a failure.
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            return 0;
+        }
+        eprintln!("searchlight: i/o error: {}", err);
+        return 2;
+    }
+
+    if found > 0 {
+        0
+    } else {
+        1
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn substring_match() {
-        let cfg = Config {
-            pattern: "err".into(),
-            files: vec![],
-            ignore_case: false,
-            show_numbers: true,
-        };
-        assert!(cfg.matches("server error 500"));
-        assert!(!cfg.matches("all good"));
+/// Resolve `--color` against the environment: `auto` colors only when
+/// stdout is a terminal and `NO_COLOR` is unset (the no-color.org rule).
+fn resolve_color(config: &Config) -> bool {
+    match config.color {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal(),
     }
+}
 
-    #[test]
-    fn case_insensitive_match() {
-        let cfg = Config {
-            pattern: "ERR".into(),
-            files: vec![],
-            ignore_case: true,
-            show_numbers: true,
-        };
-        assert!(cfg.matches("server error 500"));
+/// Classic grep rule for file-name prefixes: directories and multi-root
+/// searches get prefixes, a single explicit file does not. The default
+/// (no PATH) searches the current directory and therefore behaves like a
+/// directory scan.
+fn with_filename(config: &Config) -> bool {
+    if config.paths.len() > 1 {
+        return true;
     }
+    match config.paths.first() {
+        Some(path) => path.is_dir(),
+        None => true,
+    }
+}
+
+/// The full `--help` text. Kept in sync with `Config::parse_from` by hand;
+/// the flag reference table in the README mirrors it.
+fn help_text() -> String {
+    format!(
+        "\
+searchlight {version}
+{tagline}
+
+USAGE:
+    searchlight [OPTIONS] PATTERN [PATH]...
+
+ARGS:
+    PATTERN    Pattern in searchlight mini-regex syntax (see the README).
+    PATH...    Files or directories to search; defaults to the current directory.
+
+MATCHING:
+    -i, --ignore-case       Fold ASCII/Unicode case while matching
+    -w, --word-regexp       Require the pattern to match whole words
+    -v, --invert-match      Select lines that do not match
+    -m, --max-count N       Stop after N matching lines per file
+
+OUTPUT:
+    -n, --line-number       Prefix matches with 1-based line numbers
+    -b, --byte-offset       Prefix matches with byte offsets
+    -o, --only-matching     Print only the matched part of each line
+    -c, --count             Print per-file match counts
+    -l, --files-with-matches
+                            Print only the names of matching files
+    -B N                    N lines of context before each match
+    -A N                    N lines of context after each match
+    -C N                    N lines of context before and after
+    --color WHEN            Colorize: auto, always or never [default: auto]
+    --json                  Emit JSON Lines instead of human text
+    -q, --quiet             Print nothing; exit codes carry the result
+    -s, --no-messages       Suppress error messages on stderr
+
+FILTERING:
+    --glob PATTERN          Search only files matching PATTERN (repeatable)
+    --exclude-glob PATTERN  Skip files matching PATTERN (repeatable)
+    --max-depth N           Limit directory recursion depth (1 = top level)
+    --min-size S            Skip files smaller than S
+    --max-size S            Skip files larger than S
+    --hidden                Also search hidden files and directories
+    --no-ignore             Do not honor .gitignore and .ignore rules
+    --follow                Follow symbolic links
+
+PERFORMANCE:
+    -j, --threads N         Worker threads [default: available CPUs]
+    --stats                 Print counters and timings to stderr
+
+OTHER:
+    -h, --help              Print this help text
+    -V, --version           Print version information
+
+Sizes S accept suffixes such as: {examples}.
+
+Exit status:
+    0    at least one match was found
+    1    no matches were found
+    2    an error occurred (bad arguments, unreadable path, ...)
+",
+        version = VERSION,
+        tagline = TAGLINE,
+        examples = sizes::SIZE_EXAMPLES,
+    )
 }

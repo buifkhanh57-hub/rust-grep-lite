@@ -1,0 +1,7 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Local scratch files
+*.log
+.DS_Store

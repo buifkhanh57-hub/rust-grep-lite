@@ -1,8 +1,30 @@
 [package]
-name = "minigrep"
-version = "0.1.0"
+name = "searchlight"
+version = "1.0.0"
 edition = "2021"
-description = "A miniature grep clone in safe Rust"
+rust-version = "1.70"
+description = "Fast, parallel content-search tool for the terminal with a hand-rolled pattern engine"
 license = "MIT"
+authors = ["Bui Bao Khanh"]
+readme = "README.md"
+repository = "https://github.com/buifkhanh57-hub/searchlight"
+keywords = ["search", "grep", "cli", "parallel", "terminal"]
+categories = ["command-line-utilities", "text-processing"]
 
-[dependencies]
+# Zero external dependencies: searchlight is built entirely on the Rust
+# standard library. There is intentionally no [dependencies] section.
+
+[lib]
+name = "searchlight"
+path = "src/lib.rs"
+
+[[bin]]
+name = "searchlight"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+debug = false
